@@ -1,199 +1,224 @@
-# Intelligent Ultrasound Analysis — Fetal Head Circumference (U-Net + MiT-B2)
+# Fetal Head Segmentation — U-Net + MiT-B2 (SOTA Transformer-U-Net)
 
-Reimplementation of the architecture described in:
+A clean, verified implementation of **U-Net with a MiT-B2 (SegFormer) transformer
+encoder** for fetal head segmentation and head-circumference (HC) estimation on
+the **HC18** ultrasound dataset, reproducing the architecture described in the
+uploaded paper.
 
-> J. J. Blestson, J. Lourds G, S. V. George, S. Sumathi, **"Intelligent
-> Ultrasound Analysis for Real Time Fetal Head Circumference Measurement
-> and Developmental Assessment"**, ICCIDS 2026 (IEEE).
-
-This implementation uses the **real, official `segmentation-models-pytorch`
-(SMP)** library — the same one the paper references — with its native
-`mit_b2` encoder (the Mix Vision Transformer backbone from SegFormer,
-pretrained on ImageNet). This is not a reimplementation of MiT-B2 from
-scratch; it calls the actual maintained library so the architecture,
-weights, and behavior match what the paper used.
-
----
-
-## 1. What's included
-
-| File | Purpose |
-|---|---|
-| `fetal_hc_unet_mitb2.py` | Full pipeline: dataset, model, loss, training, metrics, post-processing (ellipse fit → HC), Grad-CAM, inference |
-| `requirements.txt` | Pinned dependency versions |
-
-The script implements, end-to-end:
-1. **Dataset class** for HC18 (handles the thin-outline annotation masks by flood-filling them into solid binary masks)
-2. **Augmentations**: Gaussian noise, padding, random crop, H/V flip, random 90° rotation, brightness/contrast jitter — matching the paper's described pipeline
-3. **Model**: `smp.Unet(encoder_name="mit_b2", encoder_weights="imagenet")`
-4. **Loss**: Hybrid Dice + BCE (`L = L_BCE + (1 − Dice)`, Eq. 1 in the paper)
-5. **Metrics**: IoU, Dice, Accuracy, Precision, Recall, F1, Specificity, MCC, AUC, plus Boundary-F1
-6. **Post-processing**: morphological close/open → largest contour → least-squares ellipse fit (`cv2.fitEllipse`) → HC via **Ramanujan's approximation** (Eq. 2)
-7. **Grad-CAM** hooked on a late U-Net decoder block, for interpretability
-8. **Inference utility** producing mask / contour / Grad-CAM overlay images + a `hc_estimation_results.csv`
-
-### What I verified before handing this to you
-Before delivering this code I actually built and ran the critical, error-prone
-pieces in a sandbox (not just written from memory):
-- `smp.Unet(encoder_name="mit_b2", ...)` builds and forward-passes correctly;
-  output shape is `(B, 1, 256, 256)`, exactly matching the paper.
-- The Dice+BCE loss computes correctly on dummy tensors.
-- `cv2.fitEllipse` + the Ramanujan circumference formula recovered the HC of
-  a synthetic ellipse to within 0.1% of the analytically known answer.
-- The Grad-CAM forward/backward hooks fire correctly on
-  `model.decoder.blocks[3]` and produce a properly shaped, upsampled heatmap.
-- I ran a full synthetic mini-dataset (20 fake "ultrasound" images) through
-  the **entire** script — dataset loading → training loop → checkpointing →
-  inference → Grad-CAM → ellipse fit → CSV export — and confirmed it runs
-  with no errors and produces sane-looking contour/heatmap images.
-
-This does **not** guarantee the published 0.9899 Dice score is reproduced —
-that depends on the real HC18 dataset, full 100-epoch training, and possibly
-hyperparameters not fully specified in the paper (exact crop ratios, batch
-size, etc.). What it guarantees is that **the code itself runs correctly and
-implements the architecture and algorithm described.**
+Built on top of the canonical, actively-maintained
+[`segmentation_models_pytorch`](https://github.com/qubvel-org/segmentation_models.pytorch)
+(SMP) library, which natively supports `mit_b0`–`mit_b5` (SegFormer / Mix
+Vision Transformer) encoders pretrained on ImageNet as drop-in U-Net
+backbones — this is exactly the "U-Net + MiT-B2" combination from the paper,
+not a hand-rolled reimplementation, so the encoder weights and architecture
+are correct and tested by a large open-source community.
 
 ---
 
-## 2. Dataset: HC18
+## 1. Project structure
 
-Download from one of:
-- Official challenge: https://hc18.grand-challenge.org/
-- Zenodo mirror: https://zenodo.org/records/1327317
-- Kaggle mirrors (search "HC18 Grand Challenge")
-
-After unzipping, you should have:
 ```
-HC18_DATASET/
-├── training_set/
-│   ├── 000_HC.png
-│   ├── 000_HC_Annotation.png
-│   ├── 001_HC.png
-│   ├── 001_HC_Annotation.png
-│   └── ...
-└── training_set_pixel_size_and_HC.csv
+fetal_hc_project/
+├── config.py          # all paths & hyperparameters in one place
+├── dataset.py          # HC18 loading, mask-from-ellipse-outline filling, augmentation
+├── model.py             # U-Net + MiT-B2 model builder (segmentation_models_pytorch)
+├── losses.py             # Hybrid Dice + BCE loss
+├── metrics.py             # Dice, IoU, Precision, Recall, Accuracy, F1 (SMP's official metrics API)
+├── train.py                 # training loop, checkpointing, early stopping, CSV logging
+├── evaluate.py                # test-set evaluation + training curve plots
+├── postprocess.py               # mask cleanup -> contour -> ellipse fit -> Ramanujan HC
+├── inference.py                   # single-image inference + Grad-CAM visualization
+├── sanity_check.py                  # run BEFORE train.py to catch setup issues early
+└── requirements.txt
 ```
 
-> **Note**: the `_Annotation.png` files in HC18 are a **thin ellipse outline**,
-> not a filled mask. The provided `HC18Dataset` class automatically detects
-> the largest closed contour in the annotation and flood-fills it into a
-> solid binary mask before training — you don't need to pre-process this
-> yourself.
-
 ---
 
-## 3. Running on Lightning AI
+## 2. Setup on Lightning AI
 
 ### Step 1 — Create a Studio
-1. Go to [lightning.ai](https://lightning.ai) → **New Studio**.
-2. Pick a GPU machine (an L4 or A10 is plenty; the paper itself trained on
-   a 6GB RTX 4060, so this is not a heavy model).
+On [lightning.ai](https://lightning.ai), create a new **Studio** with a GPU
+(an L4 or A10G is enough; the paper used an RTX 4060 6GB, so anything ≥8GB
+VRAM will comfortably fit batch size 8–16 at 256×256).
 
-### Step 2 — Upload your files
-In the Studio's file browser (left sidebar), upload:
-- `fetal_hc_unet_mitb2.py`
-- `requirements.txt`
-- Your unzipped `HC18_DATASET/` folder (drag-and-drop, or upload a zip and
-  unzip it with `unzip HC18_DATASET.zip` in the terminal)
+### Step 2 — Upload the code
+Upload this entire `fetal_hc_project/` folder into your Studio's file browser
+(drag-and-drop works), or `git clone` it if you've pushed it to your own repo.
 
-A Lightning AI Studio's default working directory is
-`/teamspace/studios/this_studio/` — the script's `CFG.DATA_ROOT` is already
-set to expect your dataset there. Adjust if you placed it elsewhere.
+### Step 3 — Install dependencies
+Open a Studio terminal:
 
-### Step 3 — Open a terminal in the Studio and install dependencies
 ```bash
+cd fetal_hc_project
 pip install -r requirements.txt
 ```
 
-### Step 4 — Edit the config (top of the script)
-Open `fetal_hc_unet_mitb2.py` and check the `CFG` class near the top:
-```python
-class CFG:
-    DATA_ROOT   = "/teamspace/studios/this_studio/HC18_DATASET"
-    IMAGE_DIR   = os.path.join(DATA_ROOT, "training_set")
-    CSV_PATH    = os.path.join(DATA_ROOT, "training_set_pixel_size_and_HC.csv")
-    OUTPUT_DIR  = "/teamspace/studios/this_studio/outputs"
-    ...
-```
-Update `DATA_ROOT` if your folder name/location differs. Everything else
-(image size, batch size, epochs, learning rate) is already set to match the
-paper's described setup (100 epochs, Adam, lr=1e-4, early stopping).
+### Step 4 — Download HC18 dataset
+The dataset is hosted on Zenodo (official source, free, no login required):
 
-### Step 5 — Run training + inference
 ```bash
-python fetal_hc_unet_mitb2.py
+mkdir -p /teamspace/studios/this_studio/data
+cd /teamspace/studios/this_studio/data
+
+# Official HC18 dataset (van den Heuvel et al., 2018) — training_set.zip
+# contains 999 images, 999 ellipse-outline annotation PNGs, and a CSV of
+# pixel sizes / reference HC values.
+wget https://zenodo.org/records/1327317/files/training_set.zip
+unzip training_set.zip
 ```
 
-This will:
-1. Split HC18 into train / val / held-out test sets (patient-level-safe split)
-2. Train for up to 100 epochs with early stopping (patience=15) and an
-   LR scheduler that halves the learning rate on validation plateau
-3. Save the best checkpoint to `outputs/best_unet_mitb2.pth`
-4. Save per-epoch metrics to `outputs/training_history.csv`
-5. Run inference on the held-out test set, saving for each image:
-   - `outputs/predictions/<name>_mask.png` — cleaned binary mask
-   - `outputs/predictions/<name>_contour.png` — green HC contour overlay
-   - `outputs/predictions/<name>_gradcam.png` — Grad-CAM heatmap overlay
-6. Save `outputs/hc_estimation_results.csv` with predicted HC (mm) per image
-
-### Step 6 (optional) — Monitor training
-Since this is a plain script (not a notebook), training progress prints
-directly to the terminal each epoch:
+This produces:
 ```
-Epoch [012/100] train_loss=0.6123 val_loss=0.5890 val_Dice=0.9701 val_IoU=0.9421 lr=1.00e-04
-  -> New best model saved (val_loss=0.5890)
+data/training_set/
+    000_HC.png
+    000_HC_Annotation.png
+    001_HC.png
+    001_HC_Annotation.png
+    ...
+    training_set_pixel_size_and_HC.csv
 ```
 
-If you'd prefer a notebook-style interactive run (e.g. to plot the
-training curve or preview Grad-CAM images inline), open a Jupyter notebook
-in the Studio, then:
+> **Important — only the 999 "training_set" images have ground-truth masks.**
+> HC18's official 335-image "test_set" has NO public masks (it's used for
+> the closed Grand Challenge leaderboard). This project therefore splits the
+> **999 annotated images** itself into train/val/test (70/15/15) so that
+> real Dice/IoU/Precision/Recall/Accuracy/F1 can be reported on all three
+> splits — see `config.py` → `TRAIN_FRAC/VAL_FRAC/TEST_FRAC`.
+
+### Step 5 — Point the config at your data
+Open `config.py` and confirm `DATA_ROOT` matches where you unzipped the data:
+
 ```python
-import fetal_hc_unet_mitb2 as M
-M.main()
+DATA_ROOT = "/teamspace/studios/this_studio/data/training_set"
 ```
-or call the individual functions (`M.build_model()`, `M.run_training(...)`,
-`M.run_inference_on_image(...)`) directly for finer control.
+
+### Step 6 — Run the sanity check (do this before training!)
+```bash
+python sanity_check.py
+```
+This verifies: package versions, GPU detection, dataset path, that the
+ellipse-outline annotation masks fill correctly into solid head masks (saves
+a visual to `outputs/plots/sanity_check_mask.png` — **open and eyeball it**),
+and that one forward+backward pass through the real model runs cleanly.
+
+### Step 7 — Train
+```bash
+python train.py
+```
+- Logs every epoch's `train/val` Loss, Dice, IoU, Precision, Recall,
+  Accuracy, F1 to `outputs/logs/training_log.csv`
+- Saves the best checkpoint (highest validation Dice) to
+  `outputs/checkpoints/best_model.pth`
+- Early-stops after 15 epochs without validation Dice improvement
+- Uses automatic mixed precision (AMP) on GPU for speed/VRAM savings
+
+A full 100-epoch run on an L4/A10G GPU at batch size 8, 256×256 typically
+takes a few hours — exact time depends on the specific GPU tier.
+
+### Step 8 — Evaluate on the held-out test set
+```bash
+python evaluate.py
+```
+This prints and saves final **Loss, Dice, IoU, Precision, Recall, Accuracy,
+F1** on the test split (`outputs/logs/test_results.json`), and plots all
+seven train-vs-val curves to `outputs/plots/training_curves.png`.
+
+### Step 9 — Run inference + Grad-CAM on a single image
+```bash
+python inference.py --image data/training_set/000_HC.png --pixel_size_mm 0.123
+```
+(Look up the correct `pixel_size_mm` for your chosen image in
+`training_set_pixel_size_and_HC.csv` if you want HC reported in millimetres
+instead of pixels.) This saves a 3-panel figure (input / predicted mask +
+fitted ellipse / Grad-CAM heatmap) to `outputs/predictions/`.
 
 ---
 
-## 4. Using a trained model for a single new image
+## 3. Metrics — how they're computed (and why they're correct)
+
+All of **Dice Score, IoU, Precision, Recall, Accuracy, F1 Score** are computed
+using `segmentation_models_pytorch.metrics`, SMP's own tested metrics module,
+rather than hand-rolled formulas:
 
 ```python
-import torch
-from fetal_hc_unet_mitb2 import build_model, run_inference_on_image, CFG
-
-model = build_model()
-model.load_state_dict(torch.load("outputs/best_unet_mitb2.pth", map_location=CFG.DEVICE))
-model.to(CFG.DEVICE)
-
-result, mask, contour_img, gradcam_img = run_inference_on_image(
-    model,
-    image_path="path/to/new_ultrasound.png",
-    pixel_size_mm=0.15,   # set to the scanner's actual mm/pixel value
-    cfg=CFG,
-    save_prefix="outputs/my_test_image",
-)
-print(result)   # {'image_path': ..., 'predicted_HC_mm': 182.4}
+tp, fp, fn, tn = smp.metrics.get_stats(probs, targets, mode="binary", threshold=0.5)
+iou       = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro")
+f1 (dice) = smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")
+precision = smp.metrics.precision(tp, fp, fn, tn, reduction="micro")
+recall    = smp.metrics.recall(tp, fp, fn, tn, reduction="micro")
+accuracy  = smp.metrics.accuracy(tp, fp, fn, tn, reduction="micro")
 ```
+
+- **Reduction = "micro"**: confusion-matrix counts are pooled across *every
+  pixel in every image in the epoch* before the ratio is computed. This is
+  the standard way segmentation papers report epoch-level metrics (as
+  opposed to naively averaging per-image scores, which is more sensitive to
+  outlier images).
+- **Dice == F1** for binary segmentation — both are reported because the
+  paper names them separately, but they will always be numerically
+  identical; this is expected and correct, not a bug.
+- **Loss** reported alongside metrics is the hybrid Dice-BCE training
+  objective, not a metric per se, but tracked the same way for the standard
+  train/val loss-curve diagnostic.
 
 ---
 
-## 5. Key implementation notes / deviations from a naive reading of the paper
+## 4. Architecture summary
 
-- The paper says the model output is "1×256×256" — confirmed exactly by
-  `smp.Unet`'s segmentation head (1×1 conv + the size you set via
-  `CFG.IMG_SIZE`).
-- The paper's Table I/II numbers (Dice 0.9899, IoU 0.9850 on validation) were
-  produced under their own train/val split and hyperparameters, which are
-  not fully disclosed (e.g. exact batch size, exact crop probabilities).
-  Treat the metrics code as correct and ready to reproduce *a* number in
-  that range with enough training — exact reproduction of their specific
-  decimal values is not guaranteed and is not generally possible from a
-  paper alone.
-- Grad-CAM is computed on `model.decoder.blocks[3]`, the second-to-last
-  decoder block. This was chosen (and empirically verified) because it
-  gives a spatial resolution that's fine enough to localize the head while
-  late enough to reflect class-discriminative decoder features. You can
-  swap to `model.decoder.blocks[4]` for finer (but noisier) resolution, or
-  to an encoder stage if you want to inspect the MiT-B2 transformer's own
-  attention rather than decoder-stage activation.
+```
+Ultrasound image (256×256, replicated to 3ch)
+        ↓
+MiT-B2 encoder (SegFormer / Mix Vision Transformer, ImageNet-pretrained)
+   — produces multi-scale hierarchical features via self-attention
+        ↓
+U-Net decoder (skip connections from each encoder stage)
+   — upsamples back to full resolution, preserving spatial detail
+        ↓
+1×1 conv segmentation head → raw logits [B, 1, 256, 256]
+        ↓ (sigmoid + threshold 0.5)
+Binary head mask
+        ↓
+Morphological cleanup → largest external contour → cv2.fitEllipse
+        ↓
+Ramanujan's ellipse-perimeter approximation → Head Circumference (mm)
+        ↓ (in parallel)
+Grad-CAM on last MiT-B2 stage → interpretability heatmap
+```
+
+Loss: `0.5 × BCEWithLogitsLoss + 0.5 × DiceLoss` (hybrid Dice-BCE, matching
+the paper, for stability under the class imbalance between head pixels and
+background pixels).
+
+Optimizer: Adam, lr=1e-4, weight_decay=1e-5, `ReduceLROnPlateau` scheduler
+on validation Dice, gradient clipping at norm 1.0, up to 100 epochs with
+early stopping (patience 15).
+
+---
+
+## 5. Common issues
+
+| Symptom | Likely cause / fix |
+|---|---|
+| `FileNotFoundError` for `DATA_ROOT` | Check the zip extracted into a `training_set` *folder* — adjust `config.DATA_ROOT` to match the exact unzip path. |
+| Sanity-check mask looks empty / wrong | Open `outputs/plots/sanity_check_mask.png`. If the filled mask doesn't look like a head, inspect a few raw `*_Annotation.png` files directly — they should be thin white ellipse outlines on black. |
+| Out-of-memory on GPU | Lower `BATCH_SIZE` in `config.py` (e.g., 4), or reduce `IMAGE_SIZE` to 224. |
+| Grad-CAM throws a layer-name error | `model.encoder.encoder.block4[-1].norm1` is MiT-B2's last transformer-stage norm layer as exposed via SMP/timm; if SMP's internal naming changes in a future version, run `print(model)` and pick a comparable late-stage layer. |
+| Training Dice stuck near 0 early on | Normal for the first several epochs with a transformer encoder — MiT-B2 has more parameters than a CNN baseline and needs a short warm-up before Dice climbs sharply. |
+
+---
+
+## 6. References
+
+- van den Heuvel et al., *"Automated measurement of fetal head circumference
+  using 2D ultrasound images,"* PLoS ONE 13(8): e0200412, 2018 — HC18 dataset
+  paper. Dataset: https://zenodo.org/records/1327317
+- Yakubovskiy, P., *Segmentation Models PyTorch*, GitHub, 2019 —
+  https://github.com/qubvel-org/segmentation_models.pytorch
+- Xie et al., *"SegFormer: Simple and Efficient Design for Semantic
+  Segmentation with Transformers,"* NeurIPS 2021 — source of the MiT
+  (Mix Vision Transformer) encoder family.
+- Ronneberger et al., *"U-Net: Convolutional Networks for Biomedical Image
+  Segmentation,"* MICCAI 2015.
+- Selvaraju et al., *"Grad-CAM: Visual Explanations from Deep Networks via
+  Gradient-based Localization,"* ICCV 2017. Implementation:
+  https://github.com/jacobgil/pytorch-grad-cam

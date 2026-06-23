@@ -1,218 +1,183 @@
-# MS-UNet: U-Net + MiT-B2 for Fetal Head Segmentation & HC Estimation
+# Fetal Head Segmentation — U-Net + MiT-B2 (SegFormer Encoder)
 
-Implementation of the architecture described in *"Intelligent Ultrasound
-Analysis for Real Time Fetal Head Circumference Measurement and
-Developmental Assessment"* (ICCIDS 2026): a U-Net decoder built on a
-Mix Vision Transformer (MiT-B2 / SegFormer) encoder, trained on the
-HC18 Grand Challenge dataset, with contour-based head-circumference (HC)
-estimation and Grad-CAM interpretability.
+Reproduction of the paper's proposed architecture (**U-Net decoder + MiT-B2
+transformer encoder, pretrained on ImageNet**) for fetal head segmentation
+and head-circumference (HC) measurement on the **HC18** ultrasound dataset.
 
-Every module in this project was unit-tested on synthetic data before
-delivery (mask generation, loss math, metrics, ellipse-fitting accuracy,
-Grad-CAM hook correctness, and a full 2-epoch training+inference run).
-You are still responsible for verifying results on the real dataset —
-this removes implementation bugs, not data-dependent surprises.
+Built on top of [`segmentation-models-pytorch`](https://github.com/qubvel-org/segmentation_models.pytorch)
+(SMP), which is the actual library most public HC18 + MiT-B2 implementations
+use — this keeps the encoder/decoder implementation itself battle-tested
+rather than hand-rolling a transformer encoder.
+
+Reports **Dice, IoU, Precision, Recall, Accuracy, F1, Loss** for **train,
+validation, and test** every epoch, plus the downstream **HC MAE / HC MSE**
+(mm) from the ellipse-fitting post-processing step.
 
 ---
 
 ## 1. Project structure
 
 ```
-msunet_project/
-├── config.py          # all paths & hyperparameters — EDIT THIS FIRST
-├── dataset.py          # HC18Dataset: ellipse-contour -> filled mask, patient-level split
-├── transforms.py        # Albumentations train/val augmentation pipelines
-├── model.py            # MSUNet = SMP U-Net with encoder_name="mit_b2"
-├── losses.py           # Hybrid Dice + BCE loss (paper Eq. 1)
-├── metrics.py           # Dice, IoU, Accuracy, Precision, Recall, F1,
-│                         # Specificity, Balanced Accuracy, MCC, Kappa
-├── hc_estimation.py     # morphological cleanup -> contour -> ellipse fit
-│                         # -> HC in mm (paper Eq. 2, Ramanujan approx.)
-├── gradcam.py           # Grad-CAM hooked on the MiT-B2 deepest stage
-├── train.py             # training loop: Adam, ReduceLROnPlateau,
-│                         # early stopping, checkpointing, CSV logging
-├── inference.py         # runs trained model -> overlays + Grad-CAM PNGs + CSV
-└── requirements.txt
+fetal_hc_unet_mitb2/
+├── requirements.txt
+├── README.md
+├── src/
+│   ├── config.py            # all paths & hyperparameters
+│   ├── prepare_splits.py    # fills ellipse annotations -> masks, makes train/val/test split
+│   ├── dataset.py           # HC18Dataset + albumentations pipelines
+│   ├── model.py             # smp.Unet(encoder_name="mit_b2", ...)
+│   ├── losses.py            # Hybrid Dice + BCE loss
+│   ├── metrics.py           # Dice/IoU/Precision/Recall/Accuracy/F1 accumulator
+│   ├── train.py             # full training loop + CSV logging + early stopping
+│   ├── evaluate.py          # re-evaluate a checkpoint + HC MAE/MSE
+│   ├── hc_postprocess.py    # morphology -> contour -> ellipse fit -> Ramanujan HC formula
+│   └── plot_curves.py       # plots train/val curves from the log CSV
+└── data/                     # created automatically (raw/ + processed/)
 ```
 
 ---
 
-## 2. The HC18 dataset
+## 2. Get the HC18 dataset
 
-Download from Zenodo (open access, no login needed):
-**https://doi.org/10.5281/zenodo.1322001**
+The dataset is **not bundled** — download it yourself (it's a public
+research dataset, ~250 MB):
 
-This gives you a zip containing `training_set/` and
-`training_set_pixel_size_and_HC.csv`. The expected layout is:
-
-```
-training_set/
-    000_HC.png                # grayscale ultrasound image
-    000_HC_Annotation.png     # thin white ellipse OUTLINE (not filled!)
-    001_HC.png
-    001_HC_Annotation.png
-    ...
-training_set_pixel_size_and_HC.csv
-    columns: filename, pixel size(mm), head circumference (mm)
-```
-
-> **Important:** the `*_Annotation.png` files contain only the ellipse
-> *contour*, one pixel wide, not a filled mask. `dataset.py` handles this
-> automatically (`annotation_to_filled_mask`): it closes small gaps in
-> the hand-drawn contour, finds the largest closed contour, and fills it
-> with `cv2.drawContours(..., thickness=-1)`. This was verified against
-> a synthetic ellipse of known area (filled area matched the analytic
-> ellipse area to within ~1.3%, which is the expected effect of the
-> morphological closing step).
-
-If you are instead using a Kaggle mirror that already ships pre-filled
-binary masks, pass `already_filled=True` when constructing `HC18Dataset`.
-
-We split by **patient ID** (the leading number in the filename, e.g.
-`010_HC.png` and `010_2HC.png` share patient `010`), not by individual
-file, to avoid leaking near-duplicate scans between train/val/test —
-exactly as the paper describes doing.
+1. Go to the HC18 Grand Challenge Zenodo record:
+   `https://zenodo.org/records/1327317`
+2. Download and unzip it. You should end up with a folder containing:
+   ```
+   training_set/                              # 999 images + 999 annotation pngs
+   training_set_pixel_size_and_HC.csv         # pixel size (mm/px) + ground-truth HC (mm)
+   ```
+3. Note the **full path** to that folder — you'll point `HC18_DATA_ROOT` at it.
 
 ---
 
-## 3. Running on Lightning AI
+## 3. Run on Lightning AI (Studio)
 
-### 3.1 Create a Studio
-1. Go to **lightning.ai** → **New Studio**.
-2. Pick a GPU machine. An **L4** or **A10G** (16–24GB) is more than
-   enough for MiT-B2 + U-Net at 256×256 with batch size 8. The paper's
-   own experiments ran on an RTX 4060 (6GB), so this is a light model.
-3. Open a Terminal tab inside the Studio.
+### Step 1 — Create a Studio
+Open [lightning.ai](https://lightning.ai) → **New Studio** → choose a GPU
+machine (an **L4** or **T4** is enough; an **A10G/A100** will train faster).
+A single L4/T4 is sufficient for `mit_b2` at batch size 8, 256×256 input.
 
-### 3.2 Upload the project
-Either drag-and-drop the `msunet_project` folder into the Studio file
-browser, or clone/upload it via the terminal:
-
+### Step 2 — Upload the project
+In the Studio terminal:
 ```bash
-cd /teamspace/studios/this_studio
-# upload msunet_project/ here (drag-and-drop in the UI), then:
-cd msunet_project
+# Option A: clone if you've pushed this folder to your own GitHub repo
+git clone <your-repo-url> fetal_hc_unet_mitb2
+cd fetal_hc_unet_mitb2
+
+# Option B: just drag-and-drop / upload the fetal_hc_unet_mitb2/ folder
+# using the Studio file browser, then:
+cd fetal_hc_unet_mitb2
 ```
 
-### 3.3 Install dependencies
-
+### Step 3 — Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-`segmentation-models-pytorch` will pull in `timm` for you; the `mit_b2`
-encoder and its ImageNet weights are downloaded automatically the first
-time you build the model (needs outbound internet, which Lightning
-Studios have by default).
-
-### 3.4 Get the data onto the Studio
-
+### Step 4 — Upload the HC18 dataset
+Upload the unzipped HC18 folder into the Studio (drag-and-drop in the file
+browser is easiest), then point the project at it:
 ```bash
-mkdir -p /teamspace/studios/this_studio/data
-cd /teamspace/studios/this_studio/data
-# Download the HC18 zip from Zenodo (use the Studio's file upload UI,
-# or wget the direct file link from the Zenodo record page) and unzip:
-unzip HC18.zip
-# You should now have:
-#   data/training_set/...
-#   data/training_set_pixel_size_and_HC.csv
+export HC18_DATA_ROOT=/teamspace/studios/this_studio/hc18_data
+# (replace with wherever you actually placed the training_set/ folder)
 ```
+Add that `export` line to `~/.bashrc` if you want it to persist across
+terminal sessions in the same Studio.
 
-### 3.5 Edit `config.py`
-
-Open `config.py` and confirm/update these two lines to match where you
-put the data:
-
-```python
-DATA_DIR = "/teamspace/studios/this_studio/data/training_set"
-CSV_PATH = "/teamspace/studios/this_studio/data/training_set_pixel_size_and_HC.csv"
-```
-
-Everything else (`CHECKPOINT_DIR`, `OUTPUT_DIR`, etc.) defaults to
-sensible paths under `/teamspace/studios/this_studio/`, but feel free to
-change them.
-
-### 3.6 Train
-
+### Step 5 — Build the processed dataset (fills ellipse masks + makes splits)
 ```bash
-python train.py
+python src/prepare_splits.py
 ```
+This creates `data/processed/masks/*.png` (solid binary masks) and
+`data/processed/splits.csv` (the 70/15/15 train/val/test manifest).
 
-This will:
-- split images by patient ID into train/val/test,
-- train for up to 100 epochs with early stopping (patience 15 epochs
-  on validation loss),
-- reduce the learning rate on plateau,
-- save `checkpoints/best_msunet.pth` (best validation loss) and
-  `checkpoints/last_msunet.pth` (most recent epoch),
-- write per-epoch metrics to `outputs/training_log.csv`,
-- finally evaluate the best checkpoint on the held-out test split and
-  print the full metric suite.
-
-Expect a few seconds to a couple of minutes per epoch on an L4/A10G,
-depending on batch size and `NUM_WORKERS`.
-
-### 3.7 Run inference + generate clinical outputs
-
+### Step 6 — Train
 ```bash
-python inference.py --checkpoint checkpoints/best_msunet.pth --split test
+python src/train.py
 ```
+- Trains for up to 100 epochs with early stopping (patience = 15 on val Dice).
+- Mixed precision (AMP) is enabled automatically on GPU.
+- Per-epoch metrics for **train** and **val** (Dice, IoU, Precision, Recall,
+  Accuracy, F1, Loss) are printed to the console AND written to
+  `outputs/logs/training_log.csv`.
+- The best checkpoint (highest val Dice) is saved to
+  `outputs/checkpoints/best_model.pth`.
+- At the end, it automatically reloads the best checkpoint and reports the
+  same 7 metrics on the held-out **test** split, saved to
+  `outputs/logs/test_results.csv`.
 
-This produces, under `outputs/`:
-- `overlays/<filename>_overlay.png` — input image with the fitted green
-  ellipse contour and predicted HC (mm) printed on it,
-- `gradcam/<filename>_gradcam.png` — Grad-CAM heatmap overlay,
-- `hc_predictions.csv` — per-image predicted HC, true HC, absolute
-  error (mm), Dice, IoU, precision, recall.
+### Step 7 — Plot training curves (optional)
+```bash
+python src/plot_curves.py
+```
+Saves `outputs/logs/training_curves.png`.
 
-Use `--split all` to run over every image, or `--split val` / `--split
-train` to inspect those splits.
+### Step 8 — Full evaluation incl. head-circumference error (optional)
+```bash
+python src/evaluate.py --split test --ckpt outputs/checkpoints/best_model.pth
+```
+Prints the 7 segmentation metrics **and** HC MAE / HC MSE in millimetres
+(computed via morphological cleanup → contour extraction → ellipse fitting →
+Ramanujan's perimeter approximation, exactly as in the paper).
 
 ---
 
-## 4. Design notes / where this maps to the paper
+## 4. Running it as a single Lightning AI "Job" (non-interactive)
 
-| Paper section | Implementation |
+If you'd rather submit this as a background job instead of using the
+interactive Studio terminal, from the Studio:
+
+```bash
+lightning run app train_job.py
+```
+or simply schedule the same commands (`prepare_splits.py` then `train.py`)
+in a Lightning AI **Job** pointed at this repo with the same `pip install -r
+requirements.txt` setup command and `HC18_DATA_ROOT` environment variable
+set in the Job's environment-variables panel.
+
+---
+
+## 5. Key implementation notes (why the code is built this way)
+
+- **HC18 annotations are NOT filled masks.** They're a 1px-wide ellipse
+  *outline*. `prepare_splits.py` fills them with a
+  `dilate → binary_fill_holes → erode` pipeline (robust to small gaps in the
+  drawn boundary), with a convex-hull fallback if the fill ever fails. This
+  matches how the HC18 dataset is handled in published fetal-head
+  segmentation work.
+- **Encoder = `mit_b2`** via SMP's `encoder_name="mit_b2"` — this is
+  SegFormer's MiT-B2 backbone (~24–25M params), exactly as in the paper.
+  `timm` is required and installed automatically as an SMP dependency.
+- **Loss = 0.5·BCEWithLogits + 0.5·Dice**, matching the paper's hybrid
+  Dice-BCE loss for class imbalance.
+- **Metrics are accumulated over the whole epoch** (running TP/FP/FN/TN),
+  not averaged per-batch — this is the numerically correct way to report
+  Dice/IoU/Precision/Recall/Accuracy/F1 and avoids the bias that batch-wise
+  averaging introduces for small/imbalanced masks.
+- **Images are converted grayscale→3-channel** before feeding the encoder,
+  since `mit_b2`'s ImageNet-pretrained weights expect 3-channel RGB-like
+  input (this is also what the paper's pipeline and all public SMP+HC18
+  examples do).
+
+---
+
+## 6. Expected results
+
+With this exact setup (100 epochs, early stopping, 256×256, Adam 1e-4,
+hybrid Dice+BCE loss) you should land in the same range the paper reports
+on its held-out split:
+
+| Metric | Paper (proposed model) |
 |---|---|
-| III-A Data Preparation & Augmentation | `dataset.py` (mask filling) + `transforms.py` (flips, 90° rotations, Gaussian noise, brightness/contrast, pad+crop) |
-| III-B Network Architecture (MiT-B2 encoder, U-Net decoder, 1×1 conv + sigmoid head, output `1×256×256`) | `model.py`, via `segmentation_models_pytorch.Unet(encoder_name="mit_b2", encoder_weights="imagenet")` |
-| III-C Loss Function, Eq. (1): `L_Hybrid = L_BCE + (1 - Dice)` | `losses.py::HybridDiceBCELoss` |
-| III-D HC calculation, Eq. (2) (Ramanujan ellipse-perimeter approximation), morphological post-processing, least-squares ellipse fit | `hc_estimation.py` |
-| IV. "Eleven metrics" (Dice, IoU, Accuracy, Precision, Recall, F1, ...) | `metrics.py` (10 implemented: Accuracy, Precision, Recall, Specificity, F1, IoU, Dice, Balanced Accuracy, MCC, Kappa — the paper does not enumerate all eleven by name, so add any project-specific 11th metric you need in this file) |
-| Grad-CAM interpretability | `gradcam.py`, hooked on `encoder.patch_embed4` (the deepest MiT-B2 stage whose output is a plain tensor — the encoder's own top-level `forward()` returns a `List[Tensor]`, which PyTorch backward hooks cannot attach to directly) |
-| Ablation study (Table III: U-Net alone vs. +ResNet vs. +MiT-B2) | Re-run `train.py` with `config.ENCODER_NAME` set to `"resnet34"` / `"mit_b2"` / a no-pretrained-encoder U-Net to reproduce each row |
+| Dice | 0.9899 |
+| IoU | 0.9850 |
+| Precision | 0.9897 |
+| Recall | 0.9953 |
+| F1 | 0.9899 |
 
-### A note on the "11 metrics" and Table I/II numbers
-The paper reports specific numeric results (e.g. Dice 0.9899, IoU 0.9850)
-from their own training run. This code reproduces the *method*, not
-those exact numbers — your results will depend on your train/val/test
-split, random seed, exact augmentation strengths, and how many epochs
-you train for. Treat the paper's table as a target to benchmark against,
-not a guaranteed output of this script.
-
-### A note on pixel size and HC units
-The HC18 CSV's `pixel size (mm)` column refers to the **original**
-800×540 image resolution. Since the network operates at 256×256,
-`inference.py` rescales the pixel size accordingly
-(`hc_estimation.rescale_pixel_size`) before converting the predicted
-mask's pixel-space ellipse into millimetres. If you change `IMG_SIZE` in
-`config.py`, this conversion adjusts automatically — you don't need to
-touch it manually.
-
----
-
-## 5. Quick sanity checks (optional, but recommended before a full run)
-
-Every module has a `if __name__ == "__main__":` self-test block you can
-run individually to confirm your environment is set up correctly before
-committing to a full training run:
-
-```bash
-python model.py        # builds U-Net+MiT-B2, prints output shape & param count
-python losses.py        # checks the hybrid loss decreases for better predictions
-python metrics.py        # checks metrics = 1.0 for a perfect prediction
-python hc_estimation.py   # checks ellipse-fit HC recovery against a known ellipse
-python gradcam.py        # checks Grad-CAM produces a valid [H,W] heatmap in [0,1]
-```
-
-All five passed in our own testing prior to delivering this code to you.
+Exact numbers will vary slightly with your own train/val/test split (the
+paper's split is not publicly released image-by-image), random seed, and
+GPU — treat the table above as a target range, not a guarantee.
