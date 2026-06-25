@@ -1,0 +1,2 @@
+model,dice,iou,precision,recall,f1,accuracy,specificity,test_loss,hc_mae_mm,hc_mse_mm2
+MS-UNet,12.97,6.95,7.69,41.96,12.97,95.82,96.22,0.9698,28.379,1125.287
