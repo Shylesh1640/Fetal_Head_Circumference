@@ -1,0 +1,74 @@
+# Model weights / checkpoints
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.ckpt
+*.onnx
+*.joblib
+*.safetensors
+*.keras
+*.pb
+*.tflite
+Best_Models/
+Frontend/uploaded_models/
+Experiments/**/checkpoints/
+
+# Experiment artifacts
+Experiments/**/attention_maps/
+Experiments/**/feature_maps/
+Experiments/**/figures/
+Experiments/**/gradcam/
+Experiments/**/logs/
+Experiments/Results/
+Experiments/__pycache__/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.local
+
+# Frontend runtime
+Frontend/.streamlit/
+Frontend/outputs/
+Frontend/__pycache__/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

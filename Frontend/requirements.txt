@@ -1,0 +1,12 @@
+streamlit>=1.36
+torch>=2.2
+opencv-python-headless>=4.9
+Pillow>=10.0
+numpy>=1.26
+pandas>=2.2
+plotly>=5.22
+streamlit-option-menu>=0.3.13
+streamlit-extras>=0.4.3
+streamlit-image-comparison>=0.0.4
+matplotlib>=3.8
+reportlab>=4.2
